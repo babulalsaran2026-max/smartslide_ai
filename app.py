@@ -1,0 +1,1437 @@
+"""
+SmartSlide AI - AI PPT Generator (single file: backend + frontend)
+
+Run:   uvicorn app:app --reload --port 8000
+Open:  http://127.0.0.1:8000
+
+Needs Ollama running locally with the llama3.2 model:  ollama pull llama3.2
+"""
+import base64
+import datetime
+import importlib.util
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+
+# Install any missing package automatically (so requirements.txt is optional).
+for _mod, _pkg in (("fastapi", "fastapi"), ("uvicorn", "uvicorn[standard]"),
+                   ("pptx", "python-pptx"), ("requests", "requests"), ("PIL", "Pillow")):
+    if importlib.util.find_spec(_mod) is None:
+        print(f"Installing {_pkg} ...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", _pkg])
+
+import fastapi  # noqa: E402
+import requests  # noqa: E402
+import uvicorn  # noqa: E402
+from fastapi import Body, FastAPI, HTTPException  # noqa: E402
+from fastapi.responses import HTMLResponse, Response  # noqa: E402
+from pptx import Presentation  # noqa: E402
+from pptx.dml.color import RGBColor  # noqa: E402
+from pptx.enum.text import PP_ALIGN  # noqa: E402
+from pptx.util import Inches, Pt  # noqa: E402
+
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+PROVIDERS = ("gemini", "groq", "openai", "deepseek", "openrouter", "anthropic", "grok", "custom", "ollama")
+
+# Default provider: Groq (API key loaded securely from settings.json or environment variable)
+CFG = {
+    "provider": os.getenv("SMARTSLIDE_PROVIDER", "openai"),
+    "base_url": os.getenv("SMARTSLIDE_BASE_URL", "https://api.groq.com/openai/v1"),
+    "model": os.getenv("SMARTSLIDE_MODEL", "openai/gpt-oss-120b"),
+    "api_key": os.getenv("SMARTSLIDE_API_KEY", ""),
+}
+if os.path.exists(CONFIG_FILE):
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as _f:
+            CFG.update({k: v for k, v in json.load(_f).items() if k in CFG})
+    except Exception:
+        pass
+
+app = fastapi.FastAPI(title="SmartSlide AI")
+
+# ----------------------------------------------------------------------------
+# AI helpers (Ollama, OpenAI-compatible, Google Gemini, Anthropic)
+# ----------------------------------------------------------------------------
+
+
+def parse_json(text: str):
+    text = str(text or "").strip()
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+    if fence:
+        try:
+            return json.loads(fence.group(1).strip())
+        except Exception:
+            text = fence.group(1).strip()
+    m = re.search(r"([\[{][\s\S]*[\]}])", text)
+    if m:
+        candidate = m.group(1).strip()
+        try:
+            return json.loads(candidate)
+        except Exception:
+            candidate_clean = re.sub(r",\s*([\]}])", r"\1", candidate)
+            try:
+                return json.loads(candidate_clean)
+            except Exception:
+                pass
+    raise HTTPException(502, "Model ne valid JSON nahi diya. Dobara try kijiye.")
+
+
+def http_error(r, provider: str, model: str = ""):
+    if r.status_code in (401, 403):
+        raise HTTPException(502, f"{provider}: API कुंजी अमान्य है या अनुमति नहीं है (HTTP {r.status_code})।")
+    if r.status_code == 404:
+        raise HTTPException(502, f"{provider}: मॉडल का नाम '{model}' या Base URL गलत है (HTTP 404)।")
+    if r.status_code == 429:
+        raise HTTPException(502, f"{provider}: दर सीमा (Rate Limit) या कोटा समाप्त हो गया है।")
+    raise HTTPException(502, f"{provider} त्रुटि {r.status_code}: {r.text[:200]}")
+
+
+def ask(prompt: str, ai_config: dict = None):
+    """Send a prompt to the user-selected AI provider (passed per-request from browser localStorage)."""
+    cfg = dict(CFG)
+    if ai_config and isinstance(ai_config, dict):
+        for k in ("provider", "base_url", "model", "api_key"):
+            if ai_config.get(k):
+                cfg[k] = str(ai_config[k]).strip()
+
+    p, key, model = cfg["provider"], cfg["api_key"], cfg["model"]
+    base = (cfg.get("base_url") or "").rstrip("/")
+
+    if p != "ollama" and not key:
+        raise HTTPException(400, "API कुंजी सेट नहीं है। कृपया होम स्क्रीन पर 'AI सेटिंग्स' में अपनी निःशुल्क API कुंजी दर्ज करें।")
+    if not model:
+        raise HTTPException(400, "मॉडल का नाम सेट नहीं है। 'AI सेटिंग्स' में मॉडल चुनें।")
+
+    try:
+        if p == "ollama":
+            r = requests.post(
+                f"{base or 'http://localhost:11434'}/api/generate",
+                json={"model": model, "prompt": prompt, "stream": False, "format": "json",
+                      "options": {"temperature": 0.6}},
+                timeout=120,
+            )
+            if not r.ok:
+                http_error(r, "Ollama", model)
+            text = r.json().get("response", "")
+        elif p == "gemini":
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
+                json={"contents": [{"parts": [{"text": prompt}]}],
+                      "generationConfig": {"responseMimeType": "application/json", "temperature": 0.6}},
+                timeout=120,
+            )
+            if not r.ok:
+                http_error(r, "Gemini", model)
+            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        elif p == "anthropic":
+            r = requests.post(
+                (base or "https://api.anthropic.com/v1") + "/messages",
+                headers={"x-api-key": key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+                json={"model": model, "max_tokens": 2048, "temperature": 0.6,
+                      "messages": [{"role": "user", "content": prompt + "\n\nReply with valid JSON only."}]},
+                timeout=120,
+            )
+            if not r.ok:
+                http_error(r, "Anthropic", model)
+            text = r.json()["content"][0]["text"]
+        else:  # openai, groq, deepseek, openrouter, grok, custom
+            url = (base or "https://api.openai.com/v1") + "/chat/completions"
+            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+            body = {"model": model, "temperature": 0.6, "messages": [{"role": "user", "content": prompt}],
+                    "response_format": {"type": "json_object"}}
+            r = requests.post(url, headers=headers, json=body, timeout=120)
+            if r.status_code == 400:
+                body.pop("response_format", None)
+                r = requests.post(url, headers=headers, json=body, timeout=120)
+            if not r.ok:
+                http_error(r, p.upper(), model)
+            text = r.json()["choices"][0]["message"]["content"]
+    except HTTPException:
+        raise
+    except requests.exceptions.ConnectionError:
+        raise HTTPException(502, f"इंटरनेट या Base URL की जांच करें - {p} सेवा से कनेक्ट नहीं हो सका।")
+    except (KeyError, IndexError, ValueError, TypeError):
+        raise HTTPException(502, "API का उत्तर पार्स नहीं किया जा सका। मॉडल का नाम और प्रदाता जांचें।")
+    except requests.RequestException as e:
+        raise HTTPException(502, f"नेटवर्क त्रुटि: {e}")
+    return parse_json(text)
+
+
+@app.get("/api/config")
+def get_config():
+    """Current AI settings. The API key itself is never sent to the browser."""
+    return {"provider": CFG["provider"], "base_url": CFG["base_url"], "model": CFG["model"],
+            "has_key": bool(CFG["api_key"])}
+
+
+@app.post("/api/config")
+def set_config(p: dict = Body(...)):
+    provider = str(p.get("provider", "ollama")).lower()
+    if provider not in PROVIDERS:
+        raise HTTPException(400, "Unknown provider")
+    CFG["provider"] = provider
+    CFG["base_url"] = str(p.get("base_url", "")).strip()
+    CFG["model"] = str(p.get("model", "")).strip()
+    if p.get("clear_key"):
+        CFG["api_key"] = ""
+    elif str(p.get("api_key", "")).strip():
+        CFG["api_key"] = str(p["api_key"]).strip()
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(CFG, f, indent=2)
+        try:
+            os.chmod(CONFIG_FILE, 0o600)
+        except OSError:
+            pass
+    except OSError as e:
+        raise HTTPException(500, f"settings.json save nahi hui: {e}")
+    return get_config()
+
+
+@app.post("/api/config/test")
+def test_config():
+    ask('Return JSON exactly like {"ok": true}')
+    return {"ok": True}
+
+
+def ctx(s: dict) -> str:
+    return (
+        f"Topic: {s.get('topic', '')}. Language: {s.get('language', 'English')}. "
+        f"Presentation type: {s.get('type', 'Educational')}. "
+        f"Audience: {s.get('audience', 'General Audience')}. "
+        f"Difficulty: {s.get('difficulty', 'Beginner')}. "
+        f"Duration: {s.get('duration', '10 minutes')}. "
+        f"Extra instructions: {s.get('instructions', '') or 'none'}."
+    )
+
+
+def as_list(v):
+    if isinstance(v, list):
+        return [str(x.get("title", x) if isinstance(x, dict) else x).strip() for x in v if x]
+    return []
+
+
+def norm_slide(d: dict, fallback_title: str, fallback_slide: dict = None, instruction: str = "") -> dict:
+    if not isinstance(d, dict):
+        d = {}
+    for wrapper in ("slide", "updated_slide", "result", "data", "output"):
+        if isinstance(d.get(wrapper), dict):
+            d = d[wrapper]
+            break
+
+    orig = fallback_slide or {}
+    fb_title = str(fallback_title or orig.get("title") or "").strip()
+    fb_bullets = list(orig.get("bullets") or [])
+    fb_notes = str(orig.get("notes") or "").strip()
+    fb_layout = str(orig.get("layout") or "bullets").strip().lower()
+    fb_iq = str(orig.get("image_query") or fb_title).strip()
+
+    title = d.get("title") or d.get("heading") or d.get("name")
+    if not title or not str(title).strip():
+        title = fb_title
+
+    bullets_raw = (
+        d.get("bullets")
+        or d.get("points")
+        or d.get("bullet_points")
+        or d.get("items")
+        or d.get("content")
+        or d.get("subtopics")
+        or d.get("key_points")
+    )
+    if not bullets_raw and fb_layout == "title" and d.get("subtitle"):
+        bullets_raw = [d["subtitle"]]
+
+    if isinstance(bullets_raw, str):
+        bullets = [b.strip("-•* \t").strip() for b in bullets_raw.split("\n") if b.strip()]
+    elif isinstance(bullets_raw, list):
+        bullets = []
+        for item in bullets_raw:
+            if isinstance(item, dict):
+                bullets.append(str(item.get("text") or item.get("point") or item.get("title") or item).strip())
+            elif item is not None and str(item).strip():
+                bullets.append(str(item).strip("-•* \t").strip())
+    else:
+        bullets = []
+
+    instr_lower = instruction.lower()
+    wants_empty = any(w in instr_lower for w in ("remove bullet", "delete bullet", "clear bullet", "no bullet", "remove all points"))
+    if not bullets and not wants_empty and fb_bullets:
+        bullets = list(fb_bullets)
+
+    notes_raw = d.get("notes") or d.get("speaker_notes") or d.get("script")
+    if isinstance(notes_raw, list):
+        notes = " ".join(str(n).strip() for n in notes_raw if str(n).strip())
+    elif notes_raw is not None and str(notes_raw).strip():
+        notes = str(notes_raw).strip()
+    else:
+        notes = fb_notes
+
+    layout = str(d.get("layout") or "").strip().lower()
+    if layout not in ("title", "bullets", "image", "cards"):
+        if fb_layout == "title":
+            if len(bullets) > 1 and any(w in instr_lower for w in ("point", "bullet", "table", "compare", "comparison", "card", "content", "example", "statistic")):
+                layout = "cards" if any(w in instr_lower for w in ("card", "table", "compare", "comparison")) else "bullets"
+            else:
+                layout = "title"
+        elif any(w in instr_lower for w in ("card", "table", "compare", "comparison")):
+            layout = "cards"
+        else:
+            layout = fb_layout or "bullets"
+
+    image_query = str(d.get("image_query") or d.get("image") or "").strip()
+    if not image_query:
+        image_query = str(d.get("title") or fb_iq or fb_title).strip()
+
+    return {
+        "title": str(title).strip(),
+        "bullets": bullets,
+        "notes": str(notes).strip(),
+        "layout": layout,
+        "image_query": str(image_query).strip(),
+    }
+
+
+# ----------------------------------------------------------------------------
+# AI endpoints
+# ----------------------------------------------------------------------------
+
+
+@app.post("/api/titles")
+def titles(p: dict = Body(...)):
+    s = p.get("settings", {})
+    existing = p.get("existing", [])
+    prompt = (
+        f"{ctx(s)}\nSuggest 4 different, catchy presentation titles for this topic."
+        + (f" Do NOT repeat these: {existing}." if existing else "")
+        + ' Return JSON exactly like {"titles": ["...", "...", "...", "..."]}'
+    )
+    return {"titles": as_list(ask(prompt).get("titles"))[:4]}
+
+
+@app.post("/api/suggestions")
+def suggestions(p: dict = Body(...)):
+    s = p.get("settings", {})
+    prompt = (
+        f"{ctx(s)}\nSuggest 8 important subtopics that a presentation on this topic "
+        'should cover. Return JSON exactly like {"subtopics": ["...", "..."]}'
+    )
+    return {"subtopics": as_list(ask(prompt).get("subtopics"))[:10]}
+
+
+@app.post("/api/outline")
+def outline(p: dict = Body(...)):
+    s = p.get("settings", {})
+    n = int(p.get("count", 8))
+    title = p.get("title", s.get("topic", ""))
+    subs = p.get("subtopics", [])
+    prompt = (
+        f"{ctx(s)}\nPresentation title: {title}.\n"
+        f"Create a slide-by-slide outline with EXACTLY {n} slide headings. "
+        "Slide 1 is the title slide; the last slide is a Conclusion (or Key Takeaways). "
+        f"Try to cover these subtopics where relevant: {subs}. Keep a logical flow. "
+        'Return JSON exactly like {"outline": ["Title Slide", "Introduction", "..."]}'
+    )
+    items = as_list(ask(prompt).get("outline"))
+    items = items[:n]
+    while len(items) < n:
+        items.append(f"Additional Topic {len(items)}")
+    return {"outline": items}
+
+
+@app.post("/api/slide")
+def make_slide(p: dict = Body(...)):
+    s = p.get("settings", {})
+    heading = p.get("heading", "")
+    length = p.get("length", "Balanced")
+    count = {"Short": "3", "Balanced": "4 to 5", "Detailed": "6"}.get(length, "4 to 5")
+    words = {"Short": "8", "Balanced": "14", "Detailed": "20"}.get(length, "14")
+    prompt = (
+        f"{ctx(s)}\nPresentation title: {p.get('title', '')}.\n"
+        f"Write slide {p.get('index', 1)} of {p.get('total', 1)}: heading \"{heading}\".\n"
+        f"Outline of whole deck: {p.get('outline', [])}.\n"
+        f"Give {count} concise bullet points (max {words} words each), simple language for the "
+        "audience, no repetition of other slides, include a real-world example or fact where "
+        "suitable, never invent statistics. Also write 2-3 sentences of speaker notes and a 2-4 "
+        "word image search query. "
+        'Return JSON exactly like {"title": "...", "bullets": ["...", "..."], '
+        '"notes": "...", "image_query": "..."}'
+    )
+    return norm_slide(ask(prompt), heading)
+
+
+@app.post("/api/assist")
+def assist(p: dict = Body(...)):
+    s = p.get("settings", {})
+    slide = p.get("slide", {})
+    instr = str(p.get("instruction", "")).strip()
+    layout = str(slide.get("layout") or ("title" if slide.get("index") == 1 else "bullets")).strip().lower()
+
+    if layout == "title":
+        layout_ctx = (
+            "This is the TITLE SLIDE of the presentation.\n"
+            "- 'title' is the main presentation title.\n"
+            "- 'bullets' should contain exactly one item: [\"subtitle\"] (a concise, compelling subtitle) unless the user explicitly requested multiple bullet points/content.\n"
+            "- If the user asks to rewrite/improve the heading or make it professional/attractive, update 'title' and/or 'bullets' as [\"subtitle\"]. Keep 'layout': 'title'.\n"
+            "- If the user explicitly asks to add multiple bullet points, cards, or a comparison table to this slide, provide them in 'bullets' and change 'layout' to 'bullets' (or 'cards')."
+        )
+    else:
+        layout_ctx = (
+            f"This is a CONTENT SLIDE with layout '{layout}'.\n"
+            "- 'title' is the slide heading.\n"
+            "- 'bullets' is the list of concise bullet points.\n"
+            "- 'notes' are the speaker notes.\n"
+            "- If the user instruction only asks to rewrite or change the heading, keep the existing bullet points and notes intact.\n"
+            "- If the user instruction only asks to change speaker notes, keep the title and bullet points intact.\n"
+            "- If the user asks to add, expand, reduce, or rephrase bullets, modify the bullets directly.\n"
+            "- If the user asks for comparison or cards, format bullets with clear comparison headers and set 'layout' to 'cards'."
+        )
+
+    prompt = (
+        f"{ctx(s)}\n"
+        "You are an expert presentation editor assisting with ONE slide of a presentation.\n\n"
+        f"{layout_ctx}\n\n"
+        f"Current slide content:\n"
+        f"{json.dumps({'title': slide.get('title', ''), 'bullets': slide.get('bullets', []), 'notes': slide.get('notes', ''), 'layout': layout}, ensure_ascii=False)}\n\n"
+        f"User Instruction: \"{instr}\"\n\n"
+        "Instructions for your response:\n"
+        "1. Strictly apply the user instruction to this slide.\n"
+        "2. Do not delete or wipe out content unless explicitly asked to remove it.\n"
+        "3. Keep the same language as the current slide unless requested otherwise.\n"
+        "4. Return ONLY a valid JSON object with the following structure:\n"
+        "{\n"
+        '  "title": "Updated slide heading",\n'
+        '  "bullets": ["Point 1", "Point 2", ...],\n'
+        '  "notes": "Speaker notes for this slide",\n'
+        f'  "layout": "{layout}",\n'
+        '  "image_query": "2-4 keyword image search query for this slide"\n'
+        "}"
+    )
+    raw = ask(prompt)
+    return norm_slide(raw, fallback_title=slide.get("title", ""), fallback_slide=slide, instruction=instr)
+
+
+@app.post("/api/extra")
+def extra(p: dict = Body(...)):
+    s = p.get("settings", {})
+    deck = "\n".join(
+        f"Slide {i + 1}: {x.get('title', '')} - " + "; ".join(x.get("bullets", []))
+        for i, x in enumerate(p.get("slides", []))
+    )
+    if p.get("kind") == "quiz":
+        task = (
+            "Create 5 multiple-choice quiz questions based on this presentation. Return JSON like "
+            '{"items": [{"q": "...", "options": ["A","B","C","D"], "answer": "A"}]}'
+        )
+    else:
+        task = 'Write a short 4-5 sentence summary. Return JSON like {"summary": "..."}'
+    return ask(f"{ctx(s)}\n{task}\nPresentation:\n{deck}")
+
+
+@app.get("/api/images")
+def images(q: str):
+    """Image search through the Wikipedia API (no API key needed)."""
+    try:
+        r = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action": "query",
+                "generator": "search",
+                "gsrsearch": q,
+                "gsrlimit": 12,
+                "prop": "pageimages",
+                "piprop": "thumbnail",
+                "pithumbsize": 800,
+                "format": "json",
+            },
+            headers={"User-Agent": "SmartSlideAI/1.0"},
+            timeout=15,
+        )
+        pages = r.json().get("query", {}).get("pages", {})
+    except Exception:
+        return {"urls": []}
+    urls = []
+    for pg in sorted(pages.values(), key=lambda x: x.get("index", 99)):
+        u = pg.get("thumbnail", {}).get("source")
+        if u and u.lower().split("?")[0].endswith((".jpg", ".jpeg", ".png")):
+            urls.append(u)
+    return {"urls": urls[:6]}
+
+
+# ----------------------------------------------------------------------------
+# PPTX export
+# ----------------------------------------------------------------------------
+
+THEMES = {
+    "modern": ("0F172A", "F8FAFC", "38BDF8"),
+    "light": ("FFFFFF", "111827", "2563EB"),
+    "corporate": ("0B2545", "FFFFFF", "F5A623"),
+    "minimalist": ("F5F5F4", "1C1917", "57534E"),
+    "creative": ("3B0764", "FDF4FF", "F472B6"),
+    "academic": ("FFF8E7", "2B2118", "9A3412"),
+}
+
+
+def rgb(h: str) -> RGBColor:
+    return RGBColor.from_string(h.lstrip("#").upper())
+
+
+def luminance(h: str) -> float:
+    h = h.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def load_image(src: str):
+    if not src:
+        return None
+    try:
+        if src.startswith("data:"):
+            return base64.b64decode(src.split(",", 1)[1])
+        r = requests.get(src, timeout=15, headers={"User-Agent": "SmartSlideAI/1.0"})
+        r.raise_for_status()
+        return r.content
+    except Exception:
+        return None
+
+
+def textbox(slide, x, y, w, h, color, anchor=None):
+    tb = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+    tf = tb.text_frame
+    tf.word_wrap = True
+    return tf
+
+
+def add_run(p, text, size, color, bold=False):
+    r = p.add_run()
+    r.text = text
+    r.font.size = Pt(size)
+    r.font.bold = bold
+    r.font.color.rgb = rgb(color)
+    return r
+
+
+@app.post("/api/export")
+def export(p: dict = Body(...)):
+    bg0, fg0, accent = THEMES.get(p.get("theme", "modern"), THEMES["modern"])
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+
+    for s in p.get("slides", []):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        bg = (s.get("bg") or "").lstrip("#") or bg0
+        fg = (("111827" if luminance(bg) > 0.55 else "F8FAFC") if s.get("bg") else fg0)
+        slide.background.fill.solid()
+        slide.background.fill.fore_color.rgb = rgb(bg)
+
+        layout = s.get("layout", "bullets")
+        size = int(s.get("fontSize") or 26)
+        bullets = s.get("bullets", [])
+        title = s.get("title", "")
+
+        if layout == "title":
+            bar = slide.shapes.add_shape(1, Inches(1.1), Inches(2.4), Inches(1.1), Inches(0.1))
+            bar.fill.solid()
+            bar.fill.fore_color.rgb = rgb(accent)
+            bar.line.fill.background()
+            tf = textbox(slide, 1.1, 2.7, 11, 1.8, fg)
+            add_run(tf.paragraphs[0], title, 54, fg, True)
+            if bullets:
+                tf2 = textbox(slide, 1.1, 4.6, 11, 1.2, fg)
+                add_run(tf2.paragraphs[0], bullets[0], 24, fg)
+        else:
+            tf = textbox(slide, 0.7, 0.45, 11.9, 1.1, fg)
+            add_run(tf.paragraphs[0], title, 38, fg, True)
+            bar = slide.shapes.add_shape(1, Inches(0.75), Inches(1.5), Inches(1.0), Inches(0.08))
+            bar.fill.solid()
+            bar.fill.fore_color.rgb = rgb(accent)
+            bar.line.fill.background()
+
+            img_bytes = load_image(s.get("image_url", "")) if layout == "image" else None
+            width = 6.4 if img_bytes else 11.9
+            tf = textbox(slide, 0.7, 1.9, width, 5.1, fg)
+            first = True
+            for b in bullets:
+                para = tf.paragraphs[0] if first else tf.add_paragraph()
+                first = False
+                para.space_after = Pt(10)
+                if layout == "cards":
+                    add_run(para, "▪ " + b, size, fg)
+                else:
+                    add_run(para, "• " + b, size, fg)
+            if img_bytes:
+                try:
+                    from PIL import Image
+
+                    iw, ih = Image.open(io.BytesIO(img_bytes)).size
+                    sc = min(5.4 / iw, 4.9 / ih)
+                    pw, ph = iw * sc, ih * sc
+                    slide.shapes.add_picture(
+                        io.BytesIO(img_bytes),
+                        Inches(7.3 + (5.4 - pw) / 2), Inches(1.9), Inches(pw), Inches(ph),
+                    )
+                except Exception:
+                    pass
+
+        if s.get("notes"):
+            slide.notes_slide.notes_text_frame.text = s["notes"]
+
+    buf = io.BytesIO()
+    prs.save(buf)
+    name = re.sub(r"[^A-Za-z0-9_-]+", "_", p.get("title", "presentation"))[:50] or "presentation"
+    return Response(
+        buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        headers={"Content-Disposition": f'attachment; filename="{name}.pptx"'},
+    )
+
+
+UA = {"User-Agent": "SmartSlideAI/1.0"}
+
+
+def wiki_context(query: str):
+    """Fetch short Wikipedia extracts to ground the fact-check."""
+    try:
+        r = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action": "query", "generator": "search", "gsrsearch": query, "gsrlimit": 3,
+                "prop": "extracts|info", "exintro": 1, "explaintext": 1, "exchars": 1200,
+                "inprop": "url", "format": "json",
+            },
+            headers=UA, timeout=15,
+        )
+        pages = sorted(r.json().get("query", {}).get("pages", {}).values(), key=lambda x: x.get("index", 99))
+    except Exception:
+        return []
+    return [
+        {"title": p.get("title", ""), "url": p.get("fullurl", ""), "extract": p.get("extract", "")}
+        for p in pages if p.get("extract")
+    ]
+
+
+@app.post("/api/factcheck")
+def factcheck(p: dict = Body(...)):
+    """Check every bullet of one slide against Wikipedia extracts + model knowledge."""
+    s = p.get("settings", {})
+    slide = p.get("slide", {})
+    bullets = [str(b) for b in slide.get("bullets", []) if str(b).strip()]
+    if not bullets:
+        return {"checks": [], "sources": [], "grounded": False}
+
+    sources, seen = [], set()
+    for q in (f"{s.get('topic', '')} {slide.get('title', '')}", slide.get("title", "")):
+        for src in wiki_context(q.strip()):
+            if src["title"] not in seen and len(sources) < 4:
+                seen.add(src["title"])
+                sources.append(src)
+
+    ref = "\n\n".join(f"[{x['title']}] {x['extract']}" for x in sources) or "(no reference text found)"
+    numbered = "\n".join(f"{i + 1}. {b}" for i, b in enumerate(bullets))
+    prompt = (
+        "You are a strict but fair fact-checker for presentation slides.\n"
+        f"Presentation topic: {s.get('topic', '')}. Slide heading: {slide.get('title', '')}.\n"
+        f"Reference text (Wikipedia):\n{ref}\n\nBullets to check:\n{numbered}\n\n"
+        "For EACH bullet choose a verdict:\n"
+        "- supported: consistent with the reference text or clearly well-established knowledge\n"
+        "- unclear: partly right, vague, or you cannot confirm it\n"
+        "- likely_wrong: contradicts the reference text or established facts\n"
+        "- unverifiable: opinion, prediction, or not checkable\n"
+        "Be conservative: only use likely_wrong when you are fairly sure. Statistics or dates with "
+        "no support should be unclear. If there is a specific error, give a corrected bullet in "
+        '"fix", otherwise leave "fix" empty. Reason must be one short sentence. '
+        'Return JSON exactly like {"checks": [{"n": 1, "verdict": "supported", "reason": "...", "fix": ""}]}'
+    )
+    raw = ask(prompt).get("checks", [])
+    by_n = {}
+    for i, c in enumerate(raw if isinstance(raw, list) else []):
+        if isinstance(c, dict):
+            try:
+                by_n[int(c.get("n", i + 1))] = c
+            except (TypeError, ValueError):
+                by_n[i + 1] = c
+    checks = []
+    for i, b in enumerate(bullets):
+        c = by_n.get(i + 1, {})
+        v = str(c.get("verdict", "unclear")).lower().strip()
+        if v not in ("supported", "unclear", "likely_wrong", "unverifiable"):
+            v = "unclear"
+        checks.append({
+            "bullet": b, "verdict": v,
+            "reason": str(c.get("reason", "")).strip(),
+            "fix": str(c.get("fix", "")).strip() if v in ("unclear", "likely_wrong") else "",
+        })
+    return {
+        "checks": checks,
+        "sources": [{"title": x["title"], "url": x["url"]} for x in sources],
+        "grounded": bool(sources),
+    }
+
+
+FEEDBACK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feedback.jsonl")
+
+
+@app.post("/api/feedback")
+def feedback(p: dict = Body(...)):
+    """Save user feedback to feedback.jsonl (one JSON object per line)."""
+    msg = str(p.get("message", "")).strip()
+    if not msg:
+        raise HTTPException(400, "Feedback message khali hai.")
+    entry = {
+        "time": datetime.datetime.now().isoformat(timespec="seconds"),
+        "rating": max(1, min(5, int(p.get("rating") or 5))),
+        "category": str(p.get("category", "General"))[:40],
+        "email": str(p.get("email", ""))[:120],
+        "message": msg[:3000],
+    }
+    with open(FEEDBACK_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return {"ok": True}
+
+
+@app.get("/api/feedback")
+def feedback_list():
+    """Developer view: http://127.0.0.1:8000/api/feedback"""
+    if not os.path.exists(FEEDBACK_FILE):
+        return []
+    with open(FEEDBACK_FILE, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+@app.get("/api/health")
+def health():
+    p = CFG["provider"]
+    if p == "ollama":
+        try:
+            tags = requests.get(f"{CFG['base_url'].rstrip('/')}/api/tags", timeout=3).json()
+            names = [m["name"] for m in tags.get("models", [])]
+        except Exception:
+            return {"ready": False, "message": 'Ollama chal nahi raha. Terminal mein "ollama serve" run kijiye, ya AI Settings mein apni API key wala provider chuniye.'}
+        if not any(n.startswith(CFG["model"]) for n in names):
+            return {"ready": False, "message": f'Model "{CFG["model"]}" installed nahi hai. Run: ollama pull {CFG["model"]}'}
+        return {"ready": True, "message": ""}
+    if not CFG["api_key"] or not CFG["model"]:
+        return {"ready": False, "message": "API key ya model name set nahi hai. 'AI Settings' button dabaiye."}
+    return {"ready": True, "message": ""}
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return INDEX_HTML
+
+
+# ----------------------------------------------------------------------------
+# Frontend (HTML + Tailwind CDN + vanilla JS)
+# ----------------------------------------------------------------------------
+
+INDEX_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SmartSlide AI</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body{font-family:Inter,system-ui,Segoe UI,Arial,sans-serif}
+  .btn{padding:.5rem .9rem;border-radius:.75rem;font-weight:600;font-size:.875rem;transition:.15s}
+  .btn-p{background:#4f46e5;color:#fff}.btn-p:hover{background:#4338ca}
+  .btn-s{background:#fff;border:1px solid #e2e8f0;color:#334155}.btn-s:hover{background:#f1f5f9}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .inp{width:100%;border:1px solid #cbd5e1;border-radius:.75rem;padding:.5rem .75rem;font-size:.9rem;background:#fff}
+  .inp:focus{outline:2px solid #818cf8;border-color:#818cf8}
+  .card{background:#fff;border:1px solid #e2e8f0;border-radius:1rem}
+  .thumb.active{outline:3px solid #6366f1}
+  .hidden{display:none!important}
+</style>
+</head>
+<body class="bg-slate-100 text-slate-800 min-h-screen">
+
+<div id="toast" class="hidden fixed top-4 right-4 z-[100] max-w-sm px-4 py-3 rounded-xl text-white text-sm shadow-lg"></div>
+<div id="busy" class="hidden fixed inset-0 z-[90] bg-black/40 flex items-center justify-center">
+  <div class="bg-white rounded-2xl px-6 py-5 shadow-xl flex items-center gap-3">
+    <div class="w-5 h-5 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin"></div>
+    <span id="busyMsg" class="font-medium">Working...</span>
+  </div>
+</div>
+<div id="modal" class="hidden fixed inset-0 z-[80] bg-black/50 flex items-center justify-center p-4" onclick="if(event.target===this)closeModal()">
+  <div class="bg-white rounded-2xl shadow-xl max-w-2xl w-full max-h-[85vh] overflow-auto p-6" id="modalBody"></div>
+</div>
+<div id="present" class="hidden fixed inset-0 z-[95] bg-black flex items-center justify-center" onclick="presentNext()"></div>
+
+<!-- ============ HOME ============ -->
+<section id="home" class="max-w-5xl mx-auto p-6">
+  <header class="flex items-center justify-between mb-8">
+    <div>
+      <h1 class="text-3xl font-extrabold text-indigo-700">SmartSlide AI</h1>
+      <p class="text-slate-500 text-sm">AI se presentation banaiye, har slide edit kijiye, .pptx download kijiye</p>
+    </div>
+    <div class="flex gap-2 items-center">
+      <button class="btn btn-s" onclick="openSettings()">&#9881; AI Settings</button>
+      <button class="btn btn-s" onclick="openFeedback()">&#128172; Feedback</button>
+      <button class="btn btn-p text-base px-5 py-3" onclick="newDeck()">+ Create New Presentation</button>
+    </div>
+  </header>
+  <div id="health" class="hidden mb-4 p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-sm"></div>
+  <input id="search" class="inp mb-5" placeholder="Search presentations by title or topic..." oninput="renderHome()">
+  <div id="deckList" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4"></div>
+</section>
+
+<!-- ============ SETUP ============ -->
+<section id="setup" class="hidden max-w-3xl mx-auto p-6">
+  <button class="btn btn-s mb-4" onclick="show('home')">&larr; Back</button>
+  <div class="card p-6 space-y-4">
+    <h2 class="text-2xl font-bold">New Presentation</h2>
+    <div><label class="text-sm font-semibold">Topic *</label>
+      <input id="f_topic" class="inp" placeholder="e.g. Artificial Intelligence"></div>
+    <div class="grid sm:grid-cols-2 gap-4">
+      <div><label class="text-sm font-semibold">Number of slides</label>
+        <select id="f_count" class="inp" onchange="$('f_custom').classList.toggle('hidden',this.value!=='custom')">
+          <option>5</option><option selected>8</option><option>10</option><option>15</option><option>20</option><option value="custom">Custom...</option></select>
+        <input id="f_custom" type="number" min="2" max="40" value="12" class="inp mt-2 hidden"></div>
+      <div><label class="text-sm font-semibold">Language</label>
+        <select id="f_language" class="inp"><option>English</option><option>Hindi</option><option>Spanish</option><option>French</option><option>German</option><option>Marathi</option><option>Bengali</option><option>Tamil</option></select></div>
+      <div><label class="text-sm font-semibold">Presentation type</label>
+        <select id="f_type" class="inp"><option>Educational</option><option>Academic</option><option>Business</option><option>Corporate</option><option>Research</option><option>Technical</option><option>Marketing</option><option>Creative</option></select></div>
+      <div><label class="text-sm font-semibold">Audience</label>
+        <select id="f_audience" class="inp"><option>School Students</option><option>College Students</option><option>Teachers</option><option>Professionals</option><option>Business Executives</option><option selected>General Audience</option></select></div>
+      <div><label class="text-sm font-semibold">Difficulty</label>
+        <select id="f_difficulty" class="inp"><option>Beginner</option><option>Intermediate</option><option>Advanced</option></select></div>
+      <div><label class="text-sm font-semibold">Duration</label>
+        <select id="f_duration" class="inp"><option>5 minutes</option><option selected>10 minutes</option><option>15 minutes</option><option>30 minutes</option></select></div>
+      <div><label class="text-sm font-semibold">Design / theme</label>
+        <select id="f_theme" class="inp"><option value="modern">Modern (dark)</option><option value="light">Light / Professional</option><option value="corporate">Corporate</option><option value="minimalist">Minimalist</option><option value="creative">Creative</option><option value="academic">Academic</option></select></div>
+      <div><label class="text-sm font-semibold">Content length</label>
+        <select id="f_length" class="inp"><option>Short</option><option selected>Balanced</option><option>Detailed</option></select></div>
+    </div>
+    <label class="flex items-center gap-2 text-sm"><input type="checkbox" id="f_images" checked> Slides par images automatically add karo (Wikipedia se)</label>
+    <label class="flex items-center gap-2 text-sm"><input type="checkbox" id="f_fact" checked> Generate ke baad content ka fact-check automatically karo (time zyada lagta hai)</label>
+    <div><label class="text-sm font-semibold">Additional instructions</label>
+      <textarea id="f_instr" rows="3" class="inp" placeholder="Any custom requirements..."></textarea></div>
+    <button class="btn btn-p w-full py-3" onclick="goTitles()">Next: Suggest titles &amp; topics &rarr;</button>
+  </div>
+</section>
+
+<!-- ============ TITLES ============ -->
+<section id="titles" class="hidden max-w-3xl mx-auto p-6">
+  <button class="btn btn-s mb-4" onclick="show('setup')">&larr; Back</button>
+  <div class="card p-6 space-y-5">
+    <h2 class="text-2xl font-bold">Choose a title</h2>
+    <div id="titleList" class="space-y-2"></div>
+    <div class="flex gap-2"><button class="btn btn-s" onclick="moreTitles()">Generate more titles</button></div>
+    <div><label class="text-sm font-semibold">Subtitle</label><input id="subtitle" class="inp" placeholder="Optional subtitle"></div>
+    <div><h3 class="font-bold mb-2">Suggested subtopics <span class="text-slate-400 font-normal text-sm">(uncheck to reject)</span></h3>
+      <div id="subList" class="grid sm:grid-cols-2 gap-2"></div></div>
+    <button class="btn btn-p w-full py-3" onclick="goOutline()">Next: Generate outline &rarr;</button>
+  </div>
+</section>
+
+<!-- ============ OUTLINE ============ -->
+<section id="outline" class="hidden max-w-3xl mx-auto p-6">
+  <button class="btn btn-s mb-4" onclick="show('titles')">&larr; Back</button>
+  <div class="card p-6 space-y-4">
+    <h2 class="text-2xl font-bold">Edit &amp; approve outline</h2>
+    <div id="outlineList" class="space-y-2"></div>
+    <div class="flex gap-2 flex-wrap">
+      <button class="btn btn-s" onclick="addOutline()">+ Add slide</button>
+      <button class="btn btn-s" onclick="regenOutline()">Regenerate outline</button>
+    </div>
+    <button class="btn btn-p w-full py-3" onclick="generateDeck()">Approve &amp; Generate presentation</button>
+  </div>
+</section>
+
+<!-- ============ GENERATING ============ -->
+<section id="generating" class="hidden max-w-xl mx-auto p-6 mt-24 text-center">
+  <div class="card p-8">
+    <div class="w-10 h-10 mx-auto border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin mb-4"></div>
+    <h2 class="text-xl font-bold mb-1">Generating your presentation...</h2>
+    <p id="genMsg" class="text-slate-500 text-sm mb-4"></p>
+    <div class="w-full bg-slate-200 rounded-full h-3"><div id="genBar" class="bg-indigo-600 h-3 rounded-full transition-all" style="width:0"></div></div>
+    <p class="text-xs text-slate-400 mt-3">Chune hue AI model ke hisaab se thoda time lag sakta hai.</p>
+  </div>
+</section>
+
+<!-- ============ EDITOR ============ -->
+<section id="editor" class="hidden h-screen flex flex-col">
+  <div class="bg-white border-b px-4 py-2 flex items-center gap-2 flex-wrap">
+    <button class="btn btn-s" onclick="goHome()">&larr; Home</button>
+    <input id="deckName" class="inp !w-64 font-semibold" oninput="S.title=this.value;scheduleSave()">
+    <button class="btn btn-s" id="undoBtn" onclick="undo()">&#8630; Undo</button>
+    <button class="btn btn-s" id="redoBtn" onclick="redo()">Redo &#8631;</button>
+    <span id="saveStatus" class="text-xs text-slate-400 mx-2"></span>
+    <div class="ml-auto flex items-center gap-2 flex-wrap">
+      <select id="themeSel" class="inp !w-auto" onchange="setTheme(this.value)">
+        <option value="modern">Modern</option><option value="light">Light</option><option value="corporate">Corporate</option>
+        <option value="minimalist">Minimalist</option><option value="creative">Creative</option><option value="academic">Academic</option></select>
+      <button class="btn btn-s" onclick="saveVersion()">Save version</button>
+      <button class="btn btn-s" onclick="showVersions()">History</button>
+      <button class="btn btn-s" onclick="openFeedback()">&#128172; Feedback</button>
+      <button class="btn btn-s" onclick="startPresent()">&#9654; Present</button>
+      <button class="btn btn-p" onclick="download()">Download .pptx</button>
+    </div>
+  </div>
+  <div class="flex-1 flex min-h-0">
+    <!-- left -->
+    <aside class="w-56 bg-slate-50 border-r flex flex-col">
+      <div class="p-2 flex gap-1">
+        <button class="btn btn-s flex-1 !px-2" title="Add slide" onclick="addSlide()">+ Add</button>
+        <button class="btn btn-s !px-2" title="Duplicate" onclick="dupSlide()">&#10697;</button>
+        <button class="btn btn-s !px-2" title="Delete" onclick="delSlide()">&#128465;</button>
+      </div>
+      <div id="thumbs" class="flex-1 overflow-auto px-2 pb-2 space-y-2"></div>
+    </aside>
+    <!-- center -->
+    <main class="flex-1 overflow-auto p-4">
+      <div id="canvasWrap" class="max-w-4xl mx-auto"><div id="canvas" class="shadow-xl rounded-lg overflow-hidden"></div></div>
+      <div class="max-w-4xl mx-auto mt-3 flex items-center gap-2 text-sm">
+        <button class="btn btn-s" onclick="go(-1)">&larr; Prev</button>
+        <span id="slideNo" class="text-slate-500"></span>
+        <button class="btn btn-s" onclick="go(1)">Next &rarr;</button>
+        <span class="ml-auto text-slate-500">Zoom</span>
+        <input type="range" min="50" max="100" value="100" id="zoom" oninput="renderCanvas()">
+      </div>
+      <div class="max-w-4xl mx-auto mt-3 card p-4 grid md:grid-cols-2 gap-3">
+        <div class="md:col-span-2"><label class="text-xs font-semibold">Heading</label><input id="e_title" class="inp" oninput="edit('title',this.value)"></div>
+        <div class="md:col-span-2"><label class="text-xs font-semibold">Bullet points (one per line)</label>
+          <textarea id="e_bullets" rows="6" class="inp" oninput="edit('bullets',this.value)"></textarea></div>
+        <div><label class="text-xs font-semibold">Layout</label>
+          <select id="e_layout" class="inp" onchange="edit('layout',this.value)">
+            <option value="title">Title slide</option><option value="bullets">Bullets</option><option value="image">Bullets + Image</option><option value="cards">Cards</option></select></div>
+        <div><label class="text-xs font-semibold">Font size: <span id="fsv"></span></label>
+          <input id="e_fs" type="range" min="16" max="40" class="w-full" oninput="edit('fontSize',+this.value)"></div>
+        <div><label class="text-xs font-semibold">Background colour</label>
+          <div class="flex gap-2"><input id="e_bg" type="color" class="h-9 w-14" oninput="edit('bg',this.value)">
+          <button class="btn btn-s" onclick="edit('bg','');renderPanel()">Reset</button></div></div>
+        <div><label class="text-xs font-semibold">Image</label>
+          <div class="flex gap-2"><input id="e_iq" class="inp" placeholder="search keywords">
+          <button class="btn btn-s" onclick="searchImg()">Search</button></div></div>
+        <div class="md:col-span-2"><div id="imgResults" class="flex gap-2 flex-wrap"></div>
+          <div class="flex gap-2 mt-2"><label class="btn btn-s cursor-pointer">Upload image<input type="file" accept="image/*" class="hidden" onchange="uploadImg(this)"></label>
+          <button class="btn btn-s" onclick="edit('image_url','');edit('layout','bullets');renderPanel()">Remove image</button></div></div>
+        <div class="md:col-span-2"><label class="text-xs font-semibold">Speaker notes</label>
+          <textarea id="e_notes" rows="3" class="inp" oninput="edit('notes',this.value)"></textarea></div>
+      </div>
+    </main>
+    <!-- right -->
+    <aside class="w-80 bg-white border-l overflow-auto p-4 space-y-4">
+      <div>
+        <h3 class="font-bold">&#10024; AI Assistant <span class="text-xs font-normal text-slate-400">(sirf selected slide)</span></h3>
+        <div class="flex flex-wrap gap-1.5 mt-2" id="quick"></div>
+        <textarea id="aiCmd" rows="2" class="inp mt-2" placeholder="Type an instruction, e.g. Add five important points" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();runAssist(this.value)}"></textarea>
+        <button class="btn btn-p w-full mt-2" onclick="runAssist($('aiCmd').value)">Run on this slide</button>
+        <button class="btn btn-s w-full mt-2" onclick="factCheckUI(S.cur)">&#9989; Fact-check this slide</button>
+        <div id="aiPreview" class="mt-3"></div>
+      </div>
+      <div class="border-t pt-3">
+        <h3 class="font-bold mb-2">Tools</h3>
+        <div class="grid grid-cols-2 gap-2">
+          <button class="btn btn-s" onclick="qualityCheck()">Quality check</button>
+          <button class="btn btn-s" onclick="factCheckAll()">Fact-check all</button>
+          <button class="btn btn-s" onclick="allNotes()">Speaker notes (all)</button>
+          <button class="btn btn-s" onclick="extra('summary')">Summary</button>
+          <button class="btn btn-s" onclick="extra('quiz')">Quiz</button>
+        </div>
+        <p id="stats" class="text-xs text-slate-500 mt-3"></p>
+      </div>
+    </aside>
+  </div>
+</section>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+const THEMES = {
+  modern:{bg:'#0f172a',fg:'#f8fafc',accent:'#38bdf8',font:'Segoe UI, Arial, sans-serif'},
+  light:{bg:'#ffffff',fg:'#111827',accent:'#2563eb',font:'Segoe UI, Arial, sans-serif'},
+  corporate:{bg:'#0b2545',fg:'#ffffff',accent:'#f5a623',font:'Segoe UI, Arial, sans-serif'},
+  minimalist:{bg:'#f5f5f4',fg:'#1c1917',accent:'#57534e',font:'Segoe UI, Arial, sans-serif'},
+  creative:{bg:'#3b0764',fg:'#fdf4ff',accent:'#f472b6',font:'Segoe UI, Arial, sans-serif'},
+  academic:{bg:'#fff8e7',fg:'#2b2118',accent:'#9a3412',font:'Georgia, serif'}
+};
+const QUICK = ['Make this slide more professional','Add five important points','Explain in simple language','Convert paragraphs into bullet points','Reduce the content','Rewrite the heading','Add real-world examples','Add relevant statistics (only if reliable)','Generate a comparison table as bullets','Make this slide more attractive'];
+
+let S = {id:null,title:'',subtitle:'',settings:{},outline:[],slides:[],cur:0,theme:'modern',versions:[],titleOptions:[],subtopics:[]};
+let hist = [], hpos = -1, saveTimer = null, commitTimer = null, pending = null;
+
+/* ---------- utilities ---------- */
+function toast(msg, err){
+  const t = $('toast'); t.textContent = msg; t.className = 'fixed top-4 right-4 z-[100] max-w-sm px-4 py-3 rounded-xl text-white text-sm shadow-lg ' + (err ? 'bg-red-600' : 'bg-emerald-600');
+  clearTimeout(t._t); t._t = setTimeout(() => t.classList.add('hidden'), 5000);
+}
+function busy(msg){ $('busyMsg').textContent = msg || 'Working...'; $('busy').classList.remove('hidden'); }
+function unbusy(){ $('busy').classList.add('hidden'); }
+function openModal(html){ $('modalBody').innerHTML = html; $('modal').classList.remove('hidden'); }
+function closeModal(){ $('modal').classList.add('hidden'); }
+async function post(path, body){
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  if(!r.ok){ let m = r.statusText; try{ m = (await r.json()).detail || m; }catch(e){} throw new Error(m); }
+  return r;
+}
+async function J(path, body){ return (await post(path, body)).json(); }
+function show(v){
+  ['home','setup','titles','outline','generating','editor'].forEach(x => $(x).classList.toggle('hidden', x !== v));
+  if(v === 'home') renderHome();
+}
+const loadAll = () => { try{ return JSON.parse(localStorage.getItem('ss_decks') || '[]'); }catch(e){ return []; } };
+const saveAll = a => localStorage.setItem('ss_decks', JSON.stringify(a));
+const lum = h => { h = h.replace('#',''); const [r,g,b] = [0,2,4].map(i => parseInt(h.substr(i,2),16)/255); return .2126*r + .7152*g + .0722*b; };
+
+/* ---------- home ---------- */
+async function checkHealth(){
+  try{
+    const h = await (await fetch('/api/health')).json(), el = $('health');
+    if(!h.ready){ el.textContent = h.message; el.classList.remove('hidden'); } else el.classList.add('hidden');
+  }catch(e){}
+}
+function renderHome(){
+  const q = ($('search').value || '').toLowerCase();
+  const decks = loadAll().filter(d => !q || (d.title||'').toLowerCase().includes(q) || (d.topic||'').toLowerCase().includes(q));
+  $('deckList').innerHTML = decks.length ? decks.map(d => `
+    <div class="card overflow-hidden">
+      <div class="cursor-pointer" onclick="openDeck('${d.id}')">${scaled(slideHTML(d.slides[0] || {title:d.title,bullets:[],layout:'title'}, d.theme), 340)}</div>
+      <div class="p-3">
+        <div class="font-semibold truncate">${esc(d.title)}</div>
+        <div class="text-xs text-slate-500">${esc(d.topic||'')} &middot; ${d.slides.length} slides &middot; ${new Date(d.updated).toLocaleDateString()}</div>
+        <div class="flex gap-1 mt-2 flex-wrap">
+          <button class="btn btn-p !py-1" onclick="openDeck('${d.id}')">Continue</button>
+          <button class="btn btn-s !py-1" onclick="renameDeck('${d.id}')">Rename</button>
+          <button class="btn btn-s !py-1" onclick="dupDeck('${d.id}')">Duplicate</button>
+          <button class="btn btn-s !py-1 text-red-600" onclick="delDeck('${d.id}')">Delete</button>
+        </div></div></div>`).join('') : '<p class="text-slate-500 col-span-full">Abhi koi presentation nahi hai. "Create New Presentation" par click kijiye.</p>';
+}
+function openDeck(id){
+  const d = loadAll().find(x => x.id === id); if(!d) return;
+  S = Object.assign({versions:[],subtitle:'',outline:[],settings:{}}, d, {cur:0});
+  hist = []; hpos = -1; commit(); show('editor'); renderAll();
+}
+function renameDeck(id){ const a = loadAll(), d = a.find(x => x.id === id), n = prompt('New name', d.title); if(n){ d.title = n; saveAll(a); renderHome(); } }
+function dupDeck(id){ const a = loadAll(), d = JSON.parse(JSON.stringify(a.find(x => x.id === id))); d.id = 'd' + Date.now(); d.title += ' (copy)'; d.updated = Date.now(); a.unshift(d); saveAll(a); renderHome(); }
+function delDeck(id){ if(confirm('Delete this presentation?')){ saveAll(loadAll().filter(x => x.id !== id)); renderHome(); } }
+function goHome(){ flushSave(); show('home'); }
+
+/* ---------- wizard ---------- */
+function newDeck(){ S = {id:'d' + Date.now(), title:'', subtitle:'', settings:{}, outline:[], slides:[], cur:0, theme:'modern', versions:[], titleOptions:[], subtopics:[]}; show('setup'); }
+function getSettings(){
+  const c = $('f_count').value;
+  return {topic:$('f_topic').value.trim(), count: c === 'custom' ? Math.max(2, Math.min(40, +$('f_custom').value || 10)) : +c,
+    language:$('f_language').value, type:$('f_type').value, audience:$('f_audience').value, difficulty:$('f_difficulty').value,
+    duration:$('f_duration').value, theme:$('f_theme').value, length:$('f_length').value, images:$('f_images').checked, factcheck:$('f_fact').checked, instructions:$('f_instr').value.trim()};
+}
+async function goTitles(){
+  S.settings = getSettings();
+  if(!S.settings.topic) return toast('Please enter a topic', true);
+  S.theme = S.settings.theme;
+  busy('Suggesting titles and subtopics...');
+  try{
+    const [t, s] = await Promise.all([J('/api/titles', {settings:S.settings, existing:[]}), J('/api/suggestions', {settings:S.settings})]);
+    S.titleOptions = t.titles; S.subtopics = s.subtopics; renderTitles(); show('titles');
+  }catch(e){ toast(e.message, true); } finally{ unbusy(); }
+}
+function renderTitles(){
+  const rows = S.titleOptions.map((t, i) => `<div class="flex gap-2 items-center"><input type="radio" name="tsel" value="${i}" ${i === 0 ? 'checked' : ''}><input class="inp t-inp" value="${esc(t)}"></div>`);
+  rows.push(`<div class="flex gap-2 items-center"><input type="radio" name="tsel" value="custom"><input class="inp t-inp" id="customTitle" placeholder="Write my own title..." onfocus="document.querySelector('input[value=custom]').checked=true"></div>`);
+  $('titleList').innerHTML = rows.join('');
+  $('subList').innerHTML = S.subtopics.map(s => `<label class="flex items-start gap-2 text-sm card p-2"><input type="checkbox" class="sub" checked value="${esc(s)}"> <span>${esc(s)}</span></label>`).join('');
+}
+async function moreTitles(){
+  const cur = [...document.querySelectorAll('.t-inp')].map(i => i.value).filter(Boolean);
+  busy('Generating more titles...');
+  try{ const t = await J('/api/titles', {settings:S.settings, existing:cur}); S.titleOptions = cur.slice(0, -0 || undefined).filter(x => x !== (($('customTitle')||{}).value)).concat(t.titles); renderTitles(); }
+  catch(e){ toast(e.message, true); } finally{ unbusy(); }
+}
+function chosenTitle(){
+  const r = document.querySelector('input[name=tsel]:checked'), inputs = [...document.querySelectorAll('.t-inp')];
+  const i = r ? (r.value === 'custom' ? inputs.length - 1 : +r.value) : 0;
+  return (inputs[i].value || '').trim() || S.settings.topic;
+}
+async function goOutline(){
+  S.title = chosenTitle(); S.subtitle = $('subtitle').value.trim();
+  S.accepted = [...document.querySelectorAll('.sub:checked')].map(c => c.value);
+  await buildOutline(); show('outline');
+}
+async function buildOutline(){
+  busy('Creating outline...');
+  try{ const r = await J('/api/outline', {settings:S.settings, title:S.title, count:S.settings.count, subtopics:S.accepted}); S.outline = r.outline; S.outline[0] = 'Title Slide'; renderOutline(); }
+  catch(e){ toast(e.message, true); } finally{ unbusy(); }
+}
+function regenOutline(){ buildOutline(); }
+function readOutline(){ S.outline = [...document.querySelectorAll('.o-inp')].map(i => i.value.trim() || 'Untitled'); }
+function renderOutline(){
+  $('outlineList').innerHTML = S.outline.map((o, i) => `<div class="flex gap-2 items-center"><span class="w-7 text-slate-400 text-sm">${i + 1}</span>
+    <input class="inp o-inp" value="${esc(o)}"><button class="btn btn-s !px-2" onclick="moveO(${i},-1)">&uarr;</button><button class="btn btn-s !px-2" onclick="moveO(${i},1)">&darr;</button><button class="btn btn-s !px-2 text-red-600" onclick="delO(${i})">&times;</button></div>`).join('');
+}
+function moveO(i, d){ readOutline(); const j = i + d; if(j < 0 || j >= S.outline.length) return; [S.outline[i], S.outline[j]] = [S.outline[j], S.outline[i]]; renderOutline(); }
+function delO(i){ readOutline(); if(S.outline.length > 2){ S.outline.splice(i, 1); renderOutline(); } }
+function addOutline(){ readOutline(); S.outline.push('New slide'); renderOutline(); }
+
+async function generateDeck(){
+  readOutline(); show('generating');
+  const total = S.outline.length; S.slides = [];
+  for(let i = 0; i < total; i++){
+    $('genMsg').textContent = `Slide ${i + 1} of ${total}: ${S.outline[i]}`; $('genBar').style.width = (i / total * 100) + '%';
+    let sl;
+    if(i === 0){ sl = {title:S.title, bullets:[S.subtitle || S.settings.topic], notes:'', layout:'title', image_query:S.settings.topic, image_url:''}; }
+    else{
+      for(let attempt = 0; attempt < 2 && !sl; attempt++){
+        try{ sl = await J('/api/slide', {settings:S.settings, title:S.title, heading:S.outline[i], index:i + 1, total, outline:S.outline, length:S.settings.length}); }catch(e){ if(attempt) toast(e.message, true); }
+      }
+      sl = sl || {title:S.outline[i], bullets:['(Generation failed - use the AI assistant to regenerate this slide)'], notes:'', image_query:S.outline[i]};
+      sl.layout = 'bullets'; sl.image_url = '';
+      if(S.settings.images){
+        try{ const im = await (await fetch('/api/images?q=' + encodeURIComponent(sl.image_query || sl.title))).json(); if(im.urls.length){ sl.image_url = im.urls[0]; sl.layout = 'image'; } }catch(e){}
+      }
+    }
+    S.slides.push(sl);
+  }
+  if(S.settings.factcheck){
+    for(let i = 1; i < S.slides.length; i++){
+      $('genMsg').textContent = `Fact-checking slide ${i + 1} of ${S.slides.length}...`; $('genBar').style.width = (i / S.slides.length * 100) + '%';
+      try{ await factCheckSlide(i); }catch(e){ if(i === 1) toast('Fact-check failed: ' + e.message, true); }
+    }
+  }
+  $('genBar').style.width = '100%'; S.cur = 0; hist = []; hpos = -1; commit(); flushSave(); show('editor'); renderAll();
+}
+
+/* ---------- slide rendering ---------- */
+function slideHTML(s, tn){
+  const t = THEMES[tn] || THEMES.modern, bg = s.bg || t.bg, fg = s.bg ? (lum(s.bg) > .55 ? '#111827' : '#f8fafc') : t.fg;
+  const fs = s.fontSize || 26, lay = s.layout || 'bullets', bl = s.bullets || [];
+  const base = `width:960px;height:540px;background:${bg};color:${fg};font-family:${t.font};box-sizing:border-box;overflow:hidden;`;
+  if(lay === 'title'){
+    return `<div style="${base}display:flex;flex-direction:column;justify-content:center;padding:80px">
+      <div style="width:90px;height:8px;background:${t.accent};border-radius:4px;margin-bottom:28px"></div>
+      <div style="font-size:54px;font-weight:800;line-height:1.1">${esc(s.title)}</div>
+      <div style="font-size:24px;opacity:.8;margin-top:22px">${esc(bl[0] || '')}</div></div>`;
+  }
+  const head = `<div style="font-size:38px;font-weight:800;line-height:1.15">${esc(s.title)}</div><div style="width:70px;height:6px;background:${t.accent};border-radius:3px;margin-top:12px"></div>`;
+  let body;
+  if(lay === 'cards'){
+    body = `<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;flex:1;margin-top:26px;align-content:start">` +
+      bl.map((b, i) => `<div style="border:2px solid ${t.accent};border-radius:16px;padding:16px;font-size:${Math.min(fs, 24)}px;line-height:1.3"><div style="color:${t.accent};font-weight:800;margin-bottom:4px">${i + 1}</div>${esc(b)}</div>`).join('') + `</div>`;
+  }else{
+    const img = (lay === 'image' && s.image_url) ? `<div style="width:340px;flex:none"><img src="${esc(s.image_url)}" style="width:100%;height:100%;object-fit:cover;border-radius:16px"></div>` : '';
+    body = `<div style="display:flex;gap:34px;flex:1;margin-top:26px;min-height:0"><ul style="flex:1;margin:0;padding-left:28px;list-style:disc;font-size:${fs}px;line-height:1.3;overflow:hidden">` +
+      bl.map(b => `<li style="margin-bottom:12px">${esc(b)}</li>`).join('') + `</ul>${img}</div>`;
+  }
+  return `<div style="${base}display:flex;flex-direction:column;padding:48px 60px">${head}${body}</div>`;
+}
+function scaled(html, w){ return `<div style="width:${w}px;height:${w * 9 / 16}px;overflow:hidden"><div style="width:960px;height:540px;transform:scale(${w / 960});transform-origin:top left">${html}</div></div>`; }
+
+/* ---------- editor ---------- */
+const cur = () => S.slides[S.cur];
+function renderAll(){ $('deckName').value = S.title; $('themeSel').value = S.theme; renderThumbs(); renderCanvas(); renderPanel(); updateUndo(); updateStats(); renderQuick(); }
+function renderThumbs(){
+  $('thumbs').innerHTML = S.slides.map((s, i) => `<div class="thumb rounded-md overflow-hidden cursor-pointer relative ${i === S.cur ? 'active' : ''}" onclick="selectSlide(${i})">${scaled(slideHTML(s, S.theme), 190)}<span class="absolute top-1 left-1 bg-black/60 text-white text-[10px] px-1.5 rounded">${i + 1}</span>${factBadge(s)}</div>`).join('');
+}
+function renderCanvas(){
+  const w = Math.min(880, $('canvasWrap').clientWidth || 880) * (+$('zoom').value / 100);
+  $('canvas').style.width = w + 'px'; $('canvas').innerHTML = scaled(slideHTML(cur(), S.theme), w);
+  $('slideNo').textContent = `Slide ${S.cur + 1} / ${S.slides.length}`;
+}
+function renderPanel(){
+  const s = cur(); if(!s) return;
+  $('e_title').value = s.title; $('e_bullets').value = (s.bullets || []).join('\n'); $('e_layout').value = s.layout || 'bullets';
+  $('e_fs').value = s.fontSize || 26; $('fsv').textContent = (s.fontSize || 26) + 'px'; $('e_bg').value = s.bg || THEMES[S.theme].bg;
+  $('e_iq').value = s.image_query || s.title; $('e_notes').value = s.notes || ''; $('imgResults').innerHTML = ''; $('aiPreview').innerHTML = '';
+}
+function renderQuick(){ $('quick').innerHTML = QUICK.map((q, i) => `<button class="text-xs px-2 py-1 rounded-full bg-indigo-50 text-indigo-700 hover:bg-indigo-100" onclick="runAssist(QUICK[${i}])">${esc(q)}</button>`).join(''); }
+function updateStats(){
+  const words = S.slides.reduce((n, s) => n + (s.notes || '').split(/\s+/).filter(Boolean).length, 0) || S.slides.reduce((n, s) => n + (s.bullets || []).join(' ').split(/\s+/).length, 0);
+  $('stats').textContent = `${S.slides.length} slides - approx. ${Math.max(1, Math.round(words / 130))} min speaking time`;
+}
+function selectSlide(i){ S.cur = i; pending = null; renderAll(); }
+function go(d){ const j = S.cur + d; if(j >= 0 && j < S.slides.length) selectSlide(j); }
+function edit(field, val){
+  const s = cur(); if(!s) return;
+  if(field === 'bullets') s.bullets = val.split('\n').map(x => x.replace(/^[-•\s]+/, '').trim()).filter(Boolean);
+  else s[field] = val;
+  if(field === 'layout' && val === 'image' && !s.image_url) toast('Image layout ke liye pehle image search/upload kijiye');
+  if(field === 'fontSize') $('fsv').textContent = val + 'px';
+  renderCanvas(); renderThumbs(); updateStats();
+  clearTimeout(commitTimer); commitTimer = setTimeout(commit, 500);
+}
+function addSlide(){ S.slides.splice(S.cur + 1, 0, {title:'New slide', bullets:['Point one'], notes:'', layout:'bullets', image_query:'', image_url:''}); S.cur++; commit(); renderAll(); }
+function dupSlide(){ S.slides.splice(S.cur + 1, 0, JSON.parse(JSON.stringify(cur()))); S.cur++; commit(); renderAll(); }
+function delSlide(){ if(S.slides.length < 2) return toast('At least one slide required', true); S.slides.splice(S.cur, 1); S.cur = Math.min(S.cur, S.slides.length - 1); commit(); renderAll(); }
+function setTheme(t){ S.theme = t; commit(); renderAll(); }
+
+async function searchImg(){
+  const q = $('e_iq').value.trim(); if(!q) return; edit('image_query', q); busy('Searching images...');
+  try{
+    const r = await (await fetch('/api/images?q=' + encodeURIComponent(q))).json();
+    $('imgResults').innerHTML = r.urls.length ? r.urls.map(u => `<img src="${esc(u)}" class="h-16 rounded cursor-pointer border-2 border-transparent hover:border-indigo-500" onclick="pickImg(this.src)">`).join('') : '<span class="text-sm text-slate-500">No images found. Try other keywords or upload one.</span>';
+  }catch(e){ toast('Image search failed', true); } finally{ unbusy(); }
+}
+function pickImg(u){ edit('image_url', u); edit('layout', 'image'); renderPanel(); }
+function uploadImg(inp){
+  const f = inp.files[0]; if(!f) return;
+  if(f.size > 2.5e6) return toast('Image 2.5 MB se chhoti rakhiye', true);
+  const r = new FileReader(); r.onload = () => { pickImg(r.result); }; r.readAsDataURL(f);
+}
+
+/* ---------- AI assistant ---------- */
+async function runAssist(instr){
+  instr = (instr || '').trim(); if(!instr) return toast('Instruction likhiye', true);
+  $('aiCmd').value = instr;
+  busy('AI is working on this slide...');
+  try{
+    const r = await J('/api/assist', {settings:S.settings, slide:cur(), instruction:instr});
+    pending = {idx:S.cur, data:r};
+    const previewSlide = Object.assign({}, cur(), r);
+    $('aiPreview').innerHTML = `<div class="text-xs font-semibold mb-1">Preview (Slide ${pending.idx + 1})</div><div class="border rounded-lg overflow-hidden">${scaled(slideHTML(previewSlide, S.theme), 270)}</div>
+      <div class="flex gap-2 mt-2"><button class="btn btn-p flex-1" onclick="applyAssist()">Apply</button><button class="btn btn-s flex-1" onclick="$('aiPreview').innerHTML='';pending=null">Discard</button></div>`;
+  }catch(e){ toast(e.message, true); } finally{ unbusy(); }
+}
+function applyAssist(){
+  if(!pending) return;
+  const target = S.slides[pending.idx];
+  if(!target){ pending = null; return; }
+  target.title = pending.data.title;
+  target.bullets = pending.data.bullets;
+  if(pending.data.notes !== undefined) target.notes = pending.data.notes;
+  if(pending.data.layout) target.layout = pending.data.layout;
+  if(pending.data.image_query) target.image_query = pending.data.image_query;
+  if(pending.idx === 0){
+    S.title = target.title;
+    if(target.bullets && target.bullets.length && target.layout === 'title') S.subtitle = target.bullets[0];
+    $('deckName').value = S.title;
+  }
+  pending = null;
+  commit();
+  renderAll();
+  toast('Applied');
+}
+async function allNotes(){
+  if(!confirm('Generate speaker notes for every slide? (thoda time lagega)')) return;
+  for(let i = 0; i < S.slides.length; i++){
+    busy(`Notes ${i + 1} / ${S.slides.length}...`);
+    try{ const r = await J('/api/assist', {settings:S.settings, slide:S.slides[i], instruction:'Write 3-4 sentences of natural speaker notes for this slide. Keep the title and bullets unchanged and put the script in "notes".'}); S.slides[i].notes = r.notes; }catch(e){ toast(e.message, true); break; }
+  }
+  unbusy(); commit(); renderPanel(); toast('Speaker notes ready');
+}
+async function extra(kind){
+  busy('Generating...');
+  try{
+    const r = await J('/api/extra', {kind, settings:S.settings, slides:S.slides});
+    if(kind === 'quiz'){
+      const items = r.items || r.questions || [];
+      openModal('<h3 class="text-xl font-bold mb-3">Quiz</h3>' + items.map((q, i) => `<div class="mb-4"><div class="font-semibold">${i + 1}. ${esc(q.q || q.question)}</div><ul class="ml-5 list-disc text-sm">${(q.options || []).map(o => `<li>${esc(o)}</li>`).join('')}</ul><div class="text-xs text-emerald-700 mt-1">Answer: ${esc(q.answer)}</div></div>`).join('') + '<button class="btn btn-s" onclick="closeModal()">Close</button>');
+    }else openModal(`<h3 class="text-xl font-bold mb-3">Summary</h3><p>${esc(r.summary)}</p><button class="btn btn-s mt-4" onclick="closeModal()">Close</button>`);
+  }catch(e){ toast(e.message, true); } finally{ unbusy(); }
+}
+
+/* ---------- fact checker ---------- */
+const VERDICT = {
+  supported:['bg-emerald-100 text-emerald-800','Supported'], unclear:['bg-amber-100 text-amber-800','Unclear'],
+  likely_wrong:['bg-red-100 text-red-800','Likely wrong'], unverifiable:['bg-slate-100 text-slate-700','Not verifiable']
+};
+function factStatus(s){
+  if(!s.fact) return 'none';
+  if(JSON.stringify(s.fact.bullets) !== JSON.stringify(s.bullets || [])) return 'stale';
+  const v = s.fact.checks.map(c => c.verdict);
+  return v.includes('likely_wrong') ? 'wrong' : v.includes('unclear') ? 'unclear' : 'ok';
+}
+function factBadge(s){
+  if(s.layout === 'title') return '';
+  const m = {none:['bg-slate-500','?','Not fact-checked'], stale:['bg-slate-500','?','Edited since last check'], ok:['bg-emerald-600','&#10003;','Fact-check passed'], unclear:['bg-amber-500','!','Some points unclear'], wrong:['bg-red-600','&#10007;','Possible errors']}[factStatus(s)];
+  return `<span title="${m[2]}" class="absolute top-1 right-1 ${m[0]} text-white text-[10px] w-4 h-4 rounded-full flex items-center justify-center">${m[1]}</span>`;
+}
+async function factCheckSlide(i){
+  const s = S.slides[i]; if(s.layout === 'title' || !(s.bullets || []).length) return;
+  const r = await J('/api/factcheck', {settings:S.settings, slide:{title:s.title, bullets:s.bullets}});
+  s.fact = {checks:r.checks, sources:r.sources, grounded:r.grounded, bullets:s.bullets.slice()};
+}
+async function factCheckUI(i){
+  if(S.slides[i].layout === 'title') return toast('Title slide ka fact-check zaroori nahi hai');
+  busy('Fact-checking slide ' + (i + 1) + '...');
+  try{ await factCheckSlide(i); commit(); renderThumbs(); showFact(i); }
+  catch(e){ toast(e.message, true); } finally{ unbusy(); }
+}
+function showFact(i){
+  const s = S.slides[i], f = s.fact; if(!f) return;
+  openModal(`<h3 class="text-xl font-bold mb-1">Fact-check: Slide ${i + 1}</h3><p class="text-sm text-slate-500 mb-3">${esc(s.title)}</p>
+    ${f.grounded ? '' : '<div class="mb-3 p-2 rounded-lg bg-amber-50 text-amber-800 text-sm">Wikipedia par koi reference nahi mila - ye check sirf model ke apne gyaan par hai, kam bharosemand.</div>'}
+    ${f.checks.map((c, j) => `<div class="border rounded-xl p-3 mb-2"><div class="flex items-start gap-2"><span class="text-xs px-2 py-0.5 rounded-full whitespace-nowrap ${VERDICT[c.verdict][0]}">${VERDICT[c.verdict][1]}</span><span class="text-sm">${esc(c.bullet)}</span></div>
+      ${c.reason ? `<div class="text-xs text-slate-500 mt-1">${esc(c.reason)}</div>` : ''}
+      ${c.fix ? `<div class="mt-2 text-sm bg-emerald-50 rounded-lg p-2">Suggested: ${esc(c.fix)}<div><button class="btn btn-s !py-1 mt-1" onclick="applyFix(${i},${j})">Apply fix</button></div></div>` : ''}</div>`).join('')}
+    <div class="text-xs text-slate-500 mt-2">Sources: ${f.sources.length ? f.sources.map(x => `<a class="text-indigo-600 underline" target="_blank" rel="noopener" href="${esc(x.url)}">${esc(x.title)}</a>`).join(', ') : 'none'}</div>
+    <p class="text-xs text-slate-400 mt-3">Ye AI-assisted check hai, final guarantee nahi. Zaroori tathyon ko khud verify kijiye.</p>
+    <button class="btn btn-s mt-3" onclick="closeModal()">Close</button>`);
+}
+function applyFix(i, j){
+  const s = S.slides[i], fix = s.fact.checks[j].fix; if(!fix) return;
+  s.bullets[j] = fix; s.fact.checks[j].fix = ''; s.fact.checks[j].verdict = 'supported'; s.fact.bullets = s.bullets.slice();
+  commit(); renderAll(); showFact(i); toast('Fix applied');
+}
+async function factCheckAll(){
+  const idx = S.slides.map((s, i) => i).filter(i => S.slides[i].layout !== 'title');
+  for(let k = 0; k < idx.length; k++){
+    busy(`Fact-checking ${k + 1} / ${idx.length}...`);
+    try{ await factCheckSlide(idx[k]); }catch(e){ toast(e.message, true); break; }
+  }
+  unbusy(); commit(); renderThumbs();
+  const bad = idx.filter(i => ['wrong', 'unclear'].includes(factStatus(S.slides[i])));
+  openModal('<h3 class="text-xl font-bold mb-3">Fact-check results</h3>' + (bad.length ? bad.map(i => `<div class="flex justify-between items-center gap-2 border-b py-2 text-sm"><span>Slide ${i + 1}: ${esc(S.slides[i].title)} <span class="text-xs ${factStatus(S.slides[i]) === 'wrong' ? 'text-red-600' : 'text-amber-600'}">(${factStatus(S.slides[i]) === 'wrong' ? 'possible errors' : 'some unclear'})</span></span><button class="btn btn-s !py-1" onclick="selectSlide(${i});showFact(${i})">Review</button></div>`).join('') : '<p class="text-emerald-700">Koi problem nahi mili. Phir bhi important facts khud verify kijiye.</p>') + '<button class="btn btn-s mt-4" onclick="closeModal()">Close</button>');
+}
+
+/* ---------- quality checker (runs locally) ---------- */
+function qualityCheck(){
+  const issues = [], seen = {};
+  S.slides.forEach((s, i) => {
+    const n = i + 1, txt = (s.bullets || []).join(' ');
+    if(!(s.title || '').trim()) issues.push([i, `Slide ${n}: missing title`]);
+    if((s.bullets || []).length > 6) issues.push([i, `Slide ${n}: too many bullets - reduce text`]);
+    if((s.bullets || []).some(b => b.split(/\s+/).length > 25)) issues.push([i, `Slide ${n}: a bullet is too long (25+ words)`]);
+    if(i > 0 && !(s.bullets || []).length) issues.push([i, `Slide ${n}: no content`]);
+    if(i > 0 && !(s.notes || '').trim()) issues.push([i, `Slide ${n}: no speaker notes`]);
+    if(s.layout !== 'title'){ const fs = factStatus(s); if(fs === 'none' || fs === 'stale') issues.push([i, `Slide ${n}: content not fact-checked (or edited since)`]); else if(fs === 'wrong') issues.push([i, `Slide ${n}: fact-check found possible errors`]); else if(fs === 'unclear') issues.push([i, `Slide ${n}: fact-check marked some points unclear`]); }
+    if(s.layout === 'image' && !s.image_url) issues.push([i, `Slide ${n}: image layout selected but no image`]);
+    if(s.bg && Math.abs(lum(s.bg) - lum(THEMES[S.theme].bg)) > .5) issues.push([i, `Slide ${n}: custom background differs a lot from theme - check consistency`]);
+    if(/\b(\w+)\s+\1\b/i.test(txt + ' ' + s.title)) issues.push([i, `Slide ${n}: repeated word found (possible typo)`]);
+    (s.bullets || []).forEach(b => { const k = b.toLowerCase(); if(seen[k] !== undefined && seen[k] !== i) issues.push([i, `Slide ${n}: bullet repeats slide ${seen[k] + 1}`]); seen[k] = i; });
+  });
+  openModal('<h3 class="text-xl font-bold mb-3">Quality check</h3>' + (issues.length ? issues.map(x => `<div class="flex justify-between gap-2 border-b py-2 text-sm"><span>${esc(x[1])}</span><button class="btn btn-s !py-1" onclick="closeModal();selectSlide(${x[0]})">Go to slide</button></div>`).join('') : '<p class="text-emerald-700">No issues found.</p>') + '<button class="btn btn-s mt-4" onclick="closeModal()">Close</button>');
+}
+
+/* ---------- history, versions, saving ---------- */
+const snap = () => JSON.stringify({slides:S.slides, cur:S.cur, theme:S.theme});
+function commit(){
+  const s = snap(); if(hist[hpos] === s) return;
+  hist = hist.slice(0, hpos + 1); hist.push(s); if(hist.length > 100) hist.shift(); hpos = hist.length - 1;
+  scheduleSave(); updateUndo();
+}
+function restore(s){ const o = JSON.parse(s); S.slides = o.slides; S.cur = Math.min(o.cur, o.slides.length - 1); S.theme = o.theme; if(S.slides[0] && S.slides[0].layout === 'title') S.title = S.slides[0].title; renderAll(); scheduleSave(); }
+function undo(){ clearTimeout(commitTimer); commit(); if(hpos > 0){ hpos--; restore(hist[hpos]); updateUndo(); } }
+function redo(){ if(hpos < hist.length - 1){ hpos++; restore(hist[hpos]); updateUndo(); } }
+function updateUndo(){ $('undoBtn').disabled = hpos <= 0; $('redoBtn').disabled = hpos >= hist.length - 1; }
+function setStatus(t){ $('saveStatus').textContent = t; }
+function scheduleSave(){ setStatus('Saving...'); clearTimeout(saveTimer); saveTimer = setTimeout(flushSave, 800); }
+function flushSave(){
+  clearTimeout(saveTimer); if(!S.id || !S.slides.length) return;
+  const a = loadAll(), d = {id:S.id, title:S.title, subtitle:S.subtitle, topic:S.settings.topic, slides:S.slides, theme:S.theme, settings:S.settings, versions:S.versions, updated:Date.now()};
+  const i = a.findIndex(x => x.id === S.id); if(i >= 0) a[i] = d; else a.unshift(d);
+  try{ saveAll(a); setStatus('All changes saved'); }catch(e){ setStatus('Save failed - storage full (remove big uploaded images)'); }
+}
+function saveVersion(){ S.versions.unshift({t:Date.now(), slides:JSON.parse(JSON.stringify(S.slides)), theme:S.theme}); S.versions = S.versions.slice(0, 15); flushSave(); toast('Version saved'); }
+function showVersions(){
+  openModal('<h3 class="text-xl font-bold mb-3">Version history</h3>' + (S.versions.length ? S.versions.map((v, i) => `<div class="flex justify-between items-center border-b py-2 text-sm"><span>${new Date(v.t).toLocaleString()} - ${v.slides.length} slides</span><button class="btn btn-s !py-1" onclick="restoreVersion(${i})">Restore</button></div>`).join('') : '<p class="text-slate-500">Abhi koi saved version nahi hai. "Save version" dabaiye.</p>') + '<p class="text-xs text-slate-400 mt-3">Restore karne se pehle current work apne aap ek naye version mein save ho jata hai.</p><button class="btn btn-s mt-3" onclick="closeModal()">Close</button>');
+}
+function restoreVersion(i){
+  const v = S.versions[i]; S.versions.unshift({t:Date.now(), slides:JSON.parse(JSON.stringify(S.slides)), theme:S.theme});
+  S.slides = JSON.parse(JSON.stringify(v.slides)); S.theme = v.theme; S.cur = 0; commit(); closeModal(); renderAll(); toast('Version restored (previous work saved in history)');
+}
+
+/* ---------- AI settings (use your own API) ---------- */
+const PROV = {
+  ollama:{url:'http://localhost:11434', ph:'llama3.2', hint:'Local Ollama - API key ki zaroorat nahi.', showUrl:true, showKey:false},
+  openai:{url:'https://api.openai.com/v1', ph:'e.g. gpt-4o-mini', hint:'OpenAI ya koi bhi OpenAI-compatible API (Groq, OpenRouter, Together, LM Studio...). Base URL badal kar doosri service use kar sakte hain.', showUrl:true, showKey:true},
+  gemini:{url:'', ph:'e.g. gemini-2.0-flash', hint:'Google Gemini API key (aistudio.google.com se). Model name Google ke docs se dekhiye.', showUrl:false, showKey:true},
+  anthropic:{url:'', ph:'claude-sonnet-5-5', hint:'Anthropic API key (console.anthropic.com se). Model name docs.claude.com se dekhiye.', showUrl:false, showKey:true}
+};
+async function openSettings(){
+  let c; try{ c = await (await fetch('/api/config')).json(); }catch(e){ return toast('Settings load nahi hui', true); }
+  openModal(`<h3 class="text-xl font-bold mb-1">AI Settings</h3>
+    <p class="text-sm text-slate-500 mb-4">Apni API yahan daaliye. Key sirf aapke computer par <code>settings.json</code> mein save hoti hai aur browser ko kabhi wapas nahi bheji jaati.</p>
+    <label class="text-sm font-semibold">Provider</label>
+    <select id="cf_prov" class="inp mb-3" onchange="provChanged()">
+      <option value="ollama">Ollama (local, free)</option><option value="openai">OpenAI / OpenAI-compatible</option>
+      <option value="gemini">Google Gemini</option><option value="anthropic">Anthropic (Claude)</option></select>
+    <div id="cf_urlbox" class="mb-3"><label class="text-sm font-semibold">Base URL</label><input id="cf_url" class="inp"></div>
+    <label class="text-sm font-semibold">Model name</label><input id="cf_model" class="inp mb-3">
+    <div id="cf_keybox" class="mb-3"><label class="text-sm font-semibold">API key</label>
+      <input id="cf_key" type="password" autocomplete="off" class="inp" placeholder="${c.has_key ? 'Key saved - naya paste karein ya blank chhodein' : 'Paste your API key'}">
+      ${c.has_key ? '<button class="text-xs text-red-600 underline mt-1" onclick="clearKey()">Saved key hata do</button>' : ''}</div>
+    <p id="cf_hint" class="text-xs text-slate-500 mb-4"></p>
+    <div class="flex gap-2"><button class="btn btn-p flex-1" onclick="saveSettings(true)">Save &amp; Test</button>
+      <button class="btn btn-s" onclick="saveSettings(false)">Save</button><button class="btn btn-s" onclick="closeModal()">Cancel</button></div>`);
+  $('cf_prov').value = c.provider; $('cf_url').value = c.base_url; $('cf_model').value = c.model; provChanged(true);
+}
+function provChanged(initial){
+  const p = PROV[$('cf_prov').value];
+  $('cf_urlbox').classList.toggle('hidden', !p.showUrl); $('cf_keybox').classList.toggle('hidden', !p.showKey);
+  $('cf_model').placeholder = p.ph; $('cf_hint').textContent = p.hint;
+  if(!initial){ $('cf_url').value = p.url; $('cf_model').value = ($('cf_prov').value === 'ollama') ? 'llama3.2' : ''; }
+}
+async function saveSettings(test){
+  const prov = $('cf_prov').value;
+  if(!$('cf_model').value.trim()) return toast('Model name likhiye', true);
+  busy(test ? 'Saving and testing...' : 'Saving...');
+  try{
+    await J('/api/config', {provider:prov, base_url:$('cf_url').value.trim(), model:$('cf_model').value.trim(), api_key:$('cf_key').value});
+    if(test){ await J('/api/config/test', {}); toast('Connected! API sahi kaam kar rahi hai.'); } else toast('Settings saved');
+    closeModal(); checkHealth();
+  }catch(e){ toast(e.message, true); } finally{ unbusy(); }
+}
+async function clearKey(){
+  try{ await J('/api/config', {provider:$('cf_prov').value, base_url:$('cf_url').value.trim(), model:$('cf_model').value.trim(), clear_key:true}); toast('Saved key hata di gayi'); closeModal(); checkHealth(); }
+  catch(e){ toast(e.message, true); }
+}
+
+/* ---------- feedback ---------- */
+let fbRating = 5;
+function openFeedback(){
+  fbRating = 5;
+  openModal(`<h3 class="text-xl font-bold mb-1">Send feedback</h3>
+    <p class="text-sm text-slate-500 mb-4">Application ke baare mein apna anubhav batayiye - bug, suggestion ya tareef.</p>
+    <label class="text-sm font-semibold">Rating</label>
+    <div id="stars" class="text-3xl mb-3 select-none">${[1,2,3,4,5].map(i => `<span class="cursor-pointer" data-i="${i}" onclick="setRating(${i})">&#9733;</span>`).join('')}</div>
+    <label class="text-sm font-semibold">Category</label>
+    <select id="fb_cat" class="inp mb-3"><option>General</option><option>Bug report</option><option>Feature request</option><option>AI quality</option><option>Design / UI</option></select>
+    <label class="text-sm font-semibold">Your feedback *</label>
+    <textarea id="fb_msg" rows="4" class="inp mb-3" placeholder="Write here..."></textarea>
+    <label class="text-sm font-semibold">Email (optional)</label>
+    <input id="fb_email" type="email" class="inp mb-4" placeholder="you@example.com">
+    <div class="flex gap-2"><button class="btn btn-p flex-1" onclick="sendFeedback()">Submit</button><button class="btn btn-s" onclick="closeModal()">Cancel</button></div>`);
+  setRating(5);
+}
+function setRating(n){ fbRating = n; document.querySelectorAll('#stars span').forEach(s => s.style.color = (+s.dataset.i <= n) ? '#f59e0b' : '#cbd5e1'); }
+async function sendFeedback(){
+  const msg = $('fb_msg').value.trim(); if(!msg) return toast('Feedback likhiye', true);
+  try{
+    await post('/api/feedback', {rating:fbRating, category:$('fb_cat').value, message:msg, email:$('fb_email').value.trim()});
+    closeModal(); toast('Thank you! Aapka feedback mil gaya.');
+  }catch(e){ toast(e.message, true); }
+}
+
+/* ---------- present & download ---------- */
+let pIdx = 0;
+function startPresent(){ pIdx = S.cur; drawPresent(); $('present').classList.remove('hidden'); document.documentElement.requestFullscreen && document.documentElement.requestFullscreen().catch(() => {}); }
+function drawPresent(){ const sc = Math.min(innerWidth / 960, innerHeight / 540); $('present').innerHTML = scaled(slideHTML(S.slides[pIdx], S.theme), 960 * sc); }
+function presentNext(){ if(pIdx < S.slides.length - 1){ pIdx++; drawPresent(); } else endPresent(); }
+function endPresent(){ $('present').classList.add('hidden'); if(document.fullscreenElement) document.exitFullscreen(); }
+document.addEventListener('keydown', e => {
+  if($('present').classList.contains('hidden')) return;
+  if(e.key === 'ArrowRight' || e.key === ' ') presentNext();
+  else if(e.key === 'ArrowLeft' && pIdx > 0){ pIdx--; drawPresent(); }
+  else if(e.key === 'Escape') endPresent();
+});
+async function download(){
+  const flagged = S.slides.map((s, i) => i + 1).filter(n => factStatus(S.slides[n - 1]) === 'wrong');
+  if(flagged.length && !confirm('Fact-check ne slide ' + flagged.join(', ') + ' mein possible galtiyan batayi hain. Phir bhi download karein?')) return;
+  busy('Building .pptx...');
+  try{
+    const r = await post('/api/export', {title:S.title, theme:S.theme, slides:S.slides}), b = await r.blob();
+    const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = (S.title || 'presentation').replace(/[^\w-]+/g, '_') + '.pptx'; a.click();
+  }catch(e){ toast(e.message, true); } finally{ unbusy(); }
+}
+addEventListener('resize', () => { if(!$('editor').classList.contains('hidden')) renderCanvas(); });
+addEventListener('beforeunload', flushSave);
+checkHealth(); show('home');
+</script>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    # Lets you start the app with "python app.py" (or the VS Code Run button).
+    print("SmartSlide AI running at http://127.0.0.1:8000  (Ctrl+C to stop)")
+    uvicorn.run(app, host="127.0.0.1", port=8000)
