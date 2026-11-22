@@ -741,7 +741,7 @@ INDEX_HTML = r"""<!doctype html>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
   body{font-family:Inter,system-ui,Segoe UI,Arial,sans-serif}
-  .btn{padding:.5rem .9rem;border-radius:.75rem;font-weight:600;font-size:.875rem;transition:.15s}
+  .btn{padding:.5rem .85rem;border-radius:.75rem;font-weight:600;font-size:.875rem;transition:.15s;white-space:nowrap}
   .btn-p{background:#4f46e5;color:#fff}.btn-p:hover{background:#4338ca}
   .btn-s{background:#fff;border:1px solid #e2e8f0;color:#334155}.btn-s:hover{background:#f1f5f9}
   .btn:disabled{opacity:.4;cursor:not-allowed}
@@ -750,6 +750,25 @@ INDEX_HTML = r"""<!doctype html>
   .card{background:#fff;border:1px solid #e2e8f0;border-radius:1rem}
   .thumb.active{outline:3px solid #6366f1}
   .hidden{display:none!important}
+  /* Mobile responsiveness enhancements */
+  @media (max-width: 768px) {
+    .mobile-thumb-strip {
+      display: flex !important;
+      flex-direction: row !important;
+      overflow-x: auto !important;
+      overflow-y: hidden !important;
+      width: 100% !important;
+      max-height: 110px !important;
+      border-right: none !important;
+      border-bottom: 1px solid #e2e8f0 !important;
+      padding: 0.5rem !important;
+      gap: 0.5rem !important;
+    }
+    .mobile-thumb-strip .thumb {
+      flex: 0 0 110px !important;
+      width: 110px !important;
+    }
+  }
 </style>
 </head>
 <body class="bg-slate-100 text-slate-800 min-h-screen">
@@ -767,16 +786,16 @@ INDEX_HTML = r"""<!doctype html>
 <div id="present" class="hidden fixed inset-0 z-[95] bg-black flex items-center justify-center" onclick="presentNext()"></div>
 
 <!-- ============ HOME ============ -->
-<section id="home" class="max-w-5xl mx-auto p-6">
-  <header class="flex items-center justify-between mb-8">
+<section id="home" class="max-w-5xl mx-auto p-4 sm:p-6">
+  <header class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6 sm:mb-8">
     <div>
-      <h1 class="text-3xl font-extrabold text-indigo-700">SmartSlide AI</h1>
-      <p class="text-slate-500 text-sm">AI se presentation banaiye, har slide edit kijiye, .pptx download kijiye</p>
+      <h1 class="text-2xl sm:text-3xl font-extrabold text-indigo-700">SmartSlide AI</h1>
+      <p class="text-slate-500 text-xs sm:text-sm">Create presentations with AI, edit slides, export .pptx</p>
     </div>
-    <div class="flex gap-2 items-center">
-      <button class="btn btn-s" onclick="openSettings()">&#9881; AI Settings</button>
-      <button class="btn btn-s" onclick="openFeedback()">&#128172; Feedback</button>
-      <button class="btn btn-p text-base px-5 py-3" onclick="newDeck()">+ Create New Presentation</button>
+    <div class="flex gap-2 items-center flex-wrap">
+      <button class="btn btn-s text-xs sm:text-sm !py-2" onclick="openSettings()">&#9881; AI Settings</button>
+      <button class="btn btn-s text-xs sm:text-sm !py-2" onclick="openFeedback()">&#128172; Feedback</button>
+      <button class="btn btn-p text-xs sm:text-sm px-4 py-2 sm:px-5 sm:py-3 w-full sm:w-auto text-center" onclick="newDeck()">+ Create New Presentation</button>
     </div>
   </header>
   <div id="health" class="hidden mb-4 p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-sm"></div>
@@ -859,36 +878,37 @@ INDEX_HTML = r"""<!doctype html>
 </section>
 
 <!-- ============ EDITOR ============ -->
-<section id="editor" class="hidden h-screen flex flex-col">
-  <div class="bg-white border-b px-4 py-2 flex items-center gap-2 flex-wrap">
-    <button class="btn btn-s" onclick="goHome()">&larr; Home</button>
-    <input id="deckName" class="inp !w-64 font-semibold" oninput="S.title=this.value;scheduleSave()">
-    <button class="btn btn-s" id="undoBtn" onclick="undo()">&#8630; Undo</button>
-    <button class="btn btn-s" id="redoBtn" onclick="redo()">Redo &#8631;</button>
-    <span id="saveStatus" class="text-xs text-slate-400 mx-2"></span>
-    <div class="ml-auto flex items-center gap-2 flex-wrap">
-      <select id="themeSel" class="inp !w-auto" onchange="setTheme(this.value)">
+<section id="editor" class="hidden min-h-screen md:h-screen flex flex-col">
+  <div class="bg-white border-b px-3 py-2 flex items-center gap-2 flex-wrap justify-between">
+    <div class="flex items-center gap-2 flex-wrap flex-1 min-w-[200px]">
+      <button class="btn btn-s !py-1 text-xs sm:text-sm" onclick="goHome()">&larr; Home</button>
+      <input id="deckName" class="inp !w-40 sm:!w-64 font-semibold text-xs sm:text-sm !py-1" oninput="S.title=this.value;scheduleSave()">
+      <button class="btn btn-s !py-1 text-xs hidden sm:inline-block" id="undoBtn" onclick="undo()">&#8630;</button>
+      <button class="btn btn-s !py-1 text-xs hidden sm:inline-block" id="redoBtn" onclick="redo()">&#8631;</button>
+      <span id="saveStatus" class="text-[11px] text-slate-400"></span>
+    </div>
+    <div class="flex items-center gap-1.5 flex-wrap">
+      <select id="themeSel" class="inp !w-auto !py-1 text-xs" onchange="setTheme(this.value)">
         <option value="modern">Modern</option><option value="light">Light</option><option value="corporate">Corporate</option>
         <option value="minimalist">Minimalist</option><option value="creative">Creative</option><option value="academic">Academic</option></select>
-      <button class="btn btn-s" onclick="saveVersion()">Save version</button>
-      <button class="btn btn-s" onclick="showVersions()">History</button>
-      <button class="btn btn-s" onclick="openFeedback()">&#128172; Feedback</button>
-      <button class="btn btn-s" onclick="startPresent()">&#9654; Present</button>
-      <button class="btn btn-p" onclick="download()">Download .pptx</button>
+      <button class="btn btn-s !py-1 text-xs hidden md:inline-block" onclick="saveVersion()">Save version</button>
+      <button class="btn btn-s !py-1 text-xs hidden md:inline-block" onclick="showVersions()">History</button>
+      <button class="btn btn-s !py-1 text-xs" onclick="startPresent()">&#9654; Present</button>
+      <button class="btn btn-p !py-1 text-xs" onclick="download()">Download .pptx</button>
     </div>
   </div>
-  <div class="flex-1 flex min-h-0">
-    <!-- left -->
-    <aside class="w-56 bg-slate-50 border-r flex flex-col">
-      <div class="p-2 flex gap-1">
-        <button class="btn btn-s flex-1 !px-2" title="Add slide" onclick="addSlide()">+ Add</button>
-        <button class="btn btn-s !px-2" title="Duplicate" onclick="dupSlide()">&#10697;</button>
-        <button class="btn btn-s !px-2" title="Delete" onclick="delSlide()">&#128465;</button>
+  <div class="flex-1 flex flex-col md:flex-row min-h-0 overflow-y-auto md:overflow-hidden">
+    <!-- left: slide thumbnails (top bar on mobile, left sidebar on desktop) -->
+    <aside class="w-full md:w-56 bg-slate-50 border-b md:border-b-0 md:border-r flex flex-row md:flex-col shrink-0">
+      <div class="p-2 flex gap-1 items-center shrink-0">
+        <button class="btn btn-s !px-2 !py-1 text-xs" title="Add slide" onclick="addSlide()">+ Add</button>
+        <button class="btn btn-s !px-2 !py-1 text-xs" title="Duplicate" onclick="dupSlide()">&#10697;</button>
+        <button class="btn btn-s !px-2 !py-1 text-xs" title="Delete" onclick="delSlide()">&#128465;</button>
       </div>
-      <div id="thumbs" class="flex-1 overflow-auto px-2 pb-2 space-y-2"></div>
+      <div id="thumbs" class="flex-1 overflow-x-auto md:overflow-y-auto px-2 pb-2 flex flex-row md:flex-col gap-2 items-center md:items-stretch"></div>
     </aside>
-    <!-- center -->
-    <main class="flex-1 overflow-auto p-4">
+    <!-- center: slide canvas & editor controls -->
+    <main class="flex-1 overflow-y-auto p-2 sm:p-4">
       <div id="canvasWrap" class="max-w-4xl mx-auto"><div id="canvas" class="shadow-xl rounded-lg overflow-hidden"></div></div>
       <div class="max-w-4xl mx-auto mt-3 flex items-center gap-2 text-sm">
         <button class="btn btn-s" onclick="go(-1)">&larr; Prev</button>
@@ -919,8 +939,8 @@ INDEX_HTML = r"""<!doctype html>
           <textarea id="e_notes" rows="3" class="inp" oninput="edit('notes',this.value)"></textarea></div>
       </div>
     </main>
-    <!-- right -->
-    <aside class="w-80 bg-white border-l overflow-auto p-4 space-y-4">
+    <!-- right: AI Assistant & Tools (bottom section on mobile, right sidebar on desktop) -->
+    <aside class="w-full md:w-80 bg-white border-t md:border-t-0 md:border-l overflow-y-auto p-4 space-y-4 shrink-0">
       <div>
         <h3 class="font-bold">&#10024; AI Assistant <span class="text-xs font-normal text-slate-400">(sirf selected slide)</span></h3>
         <div class="flex flex-wrap gap-1.5 mt-2" id="quick"></div>
@@ -1129,10 +1149,13 @@ function scaled(html, w){ return `<div style="width:${w}px;height:${w * 9 / 16}p
 const cur = () => S.slides[S.cur];
 function renderAll(){ $('deckName').value = S.title; $('themeSel').value = S.theme; renderThumbs(); renderCanvas(); renderPanel(); updateUndo(); updateStats(); renderQuick(); }
 function renderThumbs(){
-  $('thumbs').innerHTML = S.slides.map((s, i) => `<div class="thumb rounded-md overflow-hidden cursor-pointer relative ${i === S.cur ? 'active' : ''}" onclick="selectSlide(${i})">${scaled(slideHTML(s, S.theme), 190)}<span class="absolute top-1 left-1 bg-black/60 text-white text-[10px] px-1.5 rounded">${i + 1}</span>${factBadge(s)}</div>`).join('');
+  const tw = (window.innerWidth < 768) ? 100 : 190;
+  $('thumbs').innerHTML = S.slides.map((s, i) => `<div class="thumb rounded-md overflow-hidden cursor-pointer relative shrink-0 ${i === S.cur ? 'active' : ''}" onclick="selectSlide(${i})">${scaled(slideHTML(s, S.theme), tw)}<span class="absolute top-1 left-1 bg-black/60 text-white text-[10px] px-1.5 rounded">${i + 1}</span>${factBadge(s)}</div>`).join('');
 }
 function renderCanvas(){
-  const w = Math.min(880, $('canvasWrap').clientWidth || 880) * (+$('zoom').value / 100);
+  const wrapW = ($('canvasWrap') && $('canvasWrap').clientWidth) ? $('canvasWrap').clientWidth : (window.innerWidth - 32);
+  const maxW = Math.min(880, Math.max(280, wrapW - 10));
+  const w = maxW * (+$('zoom').value / 100);
   $('canvas').style.width = w + 'px'; $('canvas').innerHTML = scaled(slideHTML(cur(), S.theme), w);
   $('slideNo').textContent = `Slide ${S.cur + 1} / ${S.slides.length}`;
 }
